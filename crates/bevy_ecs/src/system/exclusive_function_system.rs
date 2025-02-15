@@ -122,6 +122,8 @@ where
             #[cfg(feature = "trace")]
             let _span_guard = self.system_meta.system_span.enter();
 
+            world.flush();
+
             let params = F::Param::get_param(
                 self.param_state.as_mut().expect(PARAM_MESSAGE),
                 &self.system_meta,
