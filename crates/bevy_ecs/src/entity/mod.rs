@@ -85,7 +85,13 @@ use crate::{
 };
 use alloc::vec::Vec;
 use bevy_platform::sync::atomic::Ordering;
-use core::{fmt, hash::Hash, mem, num::NonZero, panic::Location};
+use core::{
+    fmt,
+    hash::Hash,
+    mem::{self, MaybeUninit},
+    num::NonZero,
+    panic::Location,
+};
 use log::warn;
 
 #[cfg(feature = "serialize")]
@@ -888,7 +894,7 @@ impl Entities {
         // SAFETY: Caller guarantees that `index` a valid entity index
         let meta = unsafe { self.meta.get_unchecked_mut(index as usize) };
         meta.location = location;
-        meta.spawned_or_despawned = Some(SpawnedOrDespawned { by, at });
+        meta.spawned_or_despawned = MaybeUninit::new(SpawnedOrDespawned { by, at });
     }
 
     /// Increments the `generation` of a freed [`Entity`]. The next entity ID allocated with this
@@ -1056,12 +1062,8 @@ impl Entities {
     ///
     /// The given entity must be alive or must have been alive without being reused.
     pub unsafe fn entity_get_spawned_or_despawned_at_unchecked(&self, entity: Entity) -> Tick {
-        let meta = self.meta.get(entity.index() as usize);
-        // SAFETY: user ensured entity is allocated and generation is valid
-        let meta = unsafe { meta.unwrap_unchecked() };
-        // SAFETY: user ensured entity is either spawned or despawned
-        let spawned_or_despawned = unsafe { meta.spawned_or_despawned.unwrap_unchecked() };
-        spawned_or_despawned.at
+        // SAFETY: user ensured entity is alive or was not overwritten after despawn
+        unsafe { self.entity_get_spawned_or_despawned_unchecked(entity).at }
     }
 
     /// Returns the [`SpawnedOrDespawned`] related to the entity's las spawn or
@@ -1076,13 +1078,37 @@ impl Entities {
             (meta.generation == entity.generation)
             || (meta.location.archetype_id == ArchetypeId::INVALID)
             && (meta.generation == IdentifierMask::inc_masked_high_by(entity.generation, 1)))
-            .and_then(|meta| meta.spawned_or_despawned)
+            .map(|meta| {
+                // SAFETY: valid archetype or non-min generation proof this is init
+                unsafe { meta.spawned_or_despawned.assume_init() }
+            })
+    }
+
+    /// Returns the [`SpawnedOrDespawned`] related to the entity's las spawn or
+    /// respawn.
+    ///
+    /// # Safety
+    ///
+    ///
+    #[inline]
+    unsafe fn entity_get_spawned_or_despawned_unchecked(
+        &self,
+        entity: Entity,
+    ) -> SpawnedOrDespawned {
+        // SAFETY: user ensures entity is allocated
+        let meta = unsafe { self.meta.get_unchecked(entity.index() as usize) };
+        // SAFETY: user ensures entities of this index were at least spawned
+        unsafe { meta.spawned_or_despawned.assume_init() }
     }
 
     #[inline]
     pub(crate) fn check_change_ticks(&mut self, change_tick: Tick) {
         for meta in &mut self.meta {
-            if let Some(spawned_or_despawned) = &mut meta.spawned_or_despawned {
+            if meta.generation > NonZero::<u32>::MIN
+                || meta.location.archetype_id != ArchetypeId::INVALID
+            {
+                // SAFETY: non-min generation or valid archetype
+                let spawned_or_despawned = unsafe { meta.spawned_or_despawned.assume_init_mut() };
                 spawned_or_despawned.at.check_tick(change_tick);
             }
         }
@@ -1148,7 +1174,7 @@ struct EntityMeta {
     /// The current location of the [`Entity`]
     pub location: EntityLocation,
     /// Location of the last spawn or despawn of this entity
-    spawned_or_despawned: Option<SpawnedOrDespawned>,
+    spawned_or_despawned: MaybeUninit<SpawnedOrDespawned>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1162,7 +1188,7 @@ impl EntityMeta {
     const EMPTY: EntityMeta = EntityMeta {
         generation: NonZero::<u32>::MIN,
         location: EntityLocation::INVALID,
-        spawned_or_despawned: None,
+        spawned_or_despawned: MaybeUninit::uninit(),
     };
 }
 
